@@ -19,6 +19,24 @@ const { spawn } = require('child_process');
 const app  = express();
 const PORT = process.env.PORT || 8080;
 
+/** @param {string} [p] */
+function basename(p) {
+  return p ? path.basename(p) : '';
+}
+
+/**
+ * @param {'info'|'warn'|'error'} level
+ * @param {string} msg
+ * @param {Record<string, unknown>} [extra]
+ */
+function log(level, msg, extra) {
+  const line = `[${new Date().toISOString()}] [gif-converter] ${msg}`;
+  const tail = extra && Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : '';
+  if (level === 'error') console.error(line + tail);
+  else if (level === 'warn') console.warn(line + tail);
+  else console.log(line + tail);
+}
+
 // ── Security ──────────────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '1kb' }));
@@ -26,6 +44,10 @@ app.use(express.json({ limit: '1kb' }));
 const limiter = rateLimit({
   windowMs: 60_000, max: 10,
   message: { error: 'Too many requests. Please wait a minute.' },
+  handler: (req, res, _next, options) => {
+    log('warn', 'Rate limit hit on /api/convert', { ip: req.ip || req.socket.remoteAddress });
+    res.status(options.statusCode).json(options.message);
+  },
 });
 
 // ── Upload config ─────────────────────────────────────────────────────────────
@@ -71,6 +93,7 @@ function cleanup(filePath) {
  */
 function getVideoDuration(inputPath) {
   return new Promise((resolve, reject) => {
+    log('info', 'ffprobe start', { file: basename(inputPath) });
     const args = [
       '-v', 'quiet', '-print_format', 'json',
       '-show_streams', inputPath,
@@ -79,14 +102,22 @@ function getVideoDuration(inputPath) {
     let out = '';
     proc.stdout.on('data', d => { out += d; });
     proc.on('close', code => {
-      if (code !== 0) return reject(new Error('ffprobe failed'));
+      if (code !== 0) {
+        log('error', 'ffprobe exited non-zero', { file: basename(inputPath), code });
+        return reject(new Error('ffprobe failed'));
+      }
       try {
         const json = JSON.parse(out);
         const dur  = parseFloat(json.streams?.[0]?.duration || '0');
-        resolve(isFinite(dur) ? dur : 0);
+        const seconds = isFinite(dur) ? dur : 0;
+        log('info', 'ffprobe done', { file: basename(inputPath), durationSec: Number(seconds.toFixed(2)) });
+        resolve(seconds);
       } catch (e) { reject(e); }
     });
-    proc.on('error', reject);
+    proc.on('error', e => {
+      log('error', 'ffprobe spawn failed', { file: basename(inputPath), err: e.message });
+      reject(e);
+    });
   });
 }
 
@@ -105,6 +136,9 @@ function getVideoDuration(inputPath) {
 function convertToGif({ input, output, startTime, duration, fps, width, quality }) {
   return new Promise((resolve, reject) => {
     const paletteFile = output.replace('.gif', '_palette.png');
+    log('info', 'ffmpeg palette pass start', {
+      file: basename(input), startTime, duration, fps, width, quality,
+    });
 
     // Step 1 — generate palette
     const paletteArgs = [
@@ -118,9 +152,14 @@ function convertToGif({ input, output, startTime, duration, fps, width, quality 
 
     const p1 = spawn('ffmpeg', paletteArgs);
     p1.on('close', code1 => {
-      if (code1 !== 0) return reject(new Error('Palette generation failed'));
+      if (code1 !== 0) {
+        log('error', 'ffmpeg palette pass failed', { file: basename(input), code: code1 });
+        return reject(new Error('Palette generation failed'));
+      }
+      log('info', 'ffmpeg palette pass done', { file: basename(input) });
 
       // Step 2 — apply palette to generate GIF
+      log('info', 'ffmpeg gif encode start', { file: basename(input), out: basename(output) });
       const gifArgs = [
         '-y',
         '-ss', String(startTime),
@@ -137,12 +176,25 @@ function convertToGif({ input, output, startTime, duration, fps, width, quality 
       p2.stderr.on('data', d => { stderr += d; });
       p2.on('close', code2 => {
         cleanup(paletteFile);
-        if (code2 !== 0) return reject(new Error(`GIF conversion failed:\n${stderr.slice(-500)}`));
+        if (code2 !== 0) {
+          log('error', 'ffmpeg gif encode failed', {
+            file: basename(input), code: code2, stderrTail: stderr.slice(-400),
+          });
+          return reject(new Error(`GIF conversion failed:\n${stderr.slice(-500)}`));
+        }
+        log('info', 'ffmpeg gif encode done', { out: basename(output) });
         resolve();
       });
-      p2.on('error', e => { cleanup(paletteFile); reject(e); });
+      p2.on('error', e => {
+        cleanup(paletteFile);
+        log('error', 'ffmpeg gif spawn failed', { file: basename(input), err: e.message });
+        reject(e);
+      });
     });
-    p1.on('error', reject);
+    p1.on('error', e => {
+      log('error', 'ffmpeg palette spawn failed', { file: basename(input), err: e.message });
+      reject(e);
+    });
   });
 }
 
@@ -166,9 +218,22 @@ app.get('/api/health', (_req, res) => {
 app.post('/api/convert', limiter, upload.single('file'), async (req, res) => {
   const inputPath  = req.file?.path;
   const outputPath = inputPath ? inputPath.replace(path.extname(inputPath), '.gif') : null;
+  const t0 = Date.now();
 
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+    if (!req.file) {
+      log('warn', 'Convert rejected: no file', { ip: req.ip || req.socket.remoteAddress });
+      return res.status(400).json({ error: 'No file uploaded.' });
+    }
+
+    const uploadSize = req.file.size;
+    log('info', 'Convert request', {
+      ip: req.ip || req.socket.remoteAddress,
+      name: req.file.originalname,
+      mime: req.file.mimetype,
+      uploadMB: Number((uploadSize / 1_048_576).toFixed(2)),
+      diskName: basename(inputPath),
+    });
 
     // Parse and clamp options
     const startTime = Math.max(0, parseFloat(req.body.startTime) || 0);
@@ -178,24 +243,37 @@ app.post('/api/convert', limiter, upload.single('file'), async (req, res) => {
     const qualityMap = { low: 64, medium: 128, high: 256 };
     const quality   = qualityMap[req.body.quality] ?? 128;
 
+    log('info', 'Convert options', { startTime, durationRequested: rawDur, fps, width, qualityPreset: req.body.quality ?? 'medium', qualityColors: quality });
+
     // Validate against actual video duration
     const videoDur = await getVideoDuration(inputPath);
     if (videoDur > 0 && startTime >= videoDur) {
+      log('warn', 'Convert rejected: start past end', { startTime, videoDur });
       return res.status(400).json({ error: `Start time (${startTime}s) exceeds video length (${videoDur.toFixed(1)}s).` });
     }
     const duration = videoDur > 0
       ? Math.min(rawDur, videoDur - startTime)
       : rawDur;
 
+    if (duration < rawDur && videoDur > 0) {
+      log('info', 'Clip duration clamped to video end', { requested: rawDur, used: duration, videoDur });
+    }
+
     // Convert
     await convertToGif({ input: inputPath, output: outputPath, startTime, duration, fps, width, quality });
 
     if (!fs.existsSync(outputPath)) {
+      log('error', 'GIF missing after ffmpeg', { out: basename(outputPath) });
       return res.status(500).json({ error: 'GIF file was not created.' });
     }
 
     const stat    = fs.statSync(outputPath);
     const sizeMB  = (stat.size / 1_048_576).toFixed(2);
+    log('info', 'Convert success', {
+      out: basename(outputPath),
+      gifMB: Number(sizeMB),
+      ms: Date.now() - t0,
+    });
 
     // Stream GIF back to client
     res.setHeader('Content-Type', 'image/gif');
@@ -206,13 +284,19 @@ app.post('/api/convert', limiter, upload.single('file'), async (req, res) => {
 
     const stream = fs.createReadStream(outputPath);
     stream.pipe(res);
-    stream.on('end', () => { cleanup(inputPath); cleanup(outputPath); });
-    stream.on('error', () => { cleanup(inputPath); cleanup(outputPath); });
+    stream.on('end', () => {
+      log('info', 'Response stream finished; cleanup', { in: basename(inputPath), out: basename(outputPath) });
+      cleanup(inputPath); cleanup(outputPath);
+    });
+    stream.on('error', err => {
+      log('error', 'Response stream error', { err: err.message, out: basename(outputPath) });
+      cleanup(inputPath); cleanup(outputPath);
+    });
 
   } catch (err) {
     cleanup(inputPath);
     cleanup(outputPath);
-    console.error('Conversion error:', err.message);
+    log('error', 'Convert failed', { err: err.message, ms: Date.now() - t0, in: basename(inputPath) });
     res.status(500).json({ error: err.message || 'Conversion failed.' });
   }
 });
@@ -222,15 +306,18 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   if (err.code === 'LIMIT_FILE_SIZE') {
+    log('warn', 'Upload rejected: over size limit', { maxMB: MAX_FILE_MB, ip: req.ip || req.socket.remoteAddress });
     return res.status(413).json({ error: `File too large. Max ${MAX_FILE_MB}MB.` });
   }
+  log('error', 'Unhandled error', { path: req.path, err: err.message, code: err.code });
   console.error(err);
   res.status(500).json({ error: err.message || 'Something went wrong.' });
 });
 
 app.listen(PORT, () => {
+  log('info', 'Server listening', { port: PORT, maxFileMB: MAX_FILE_MB, maxDurationSec: MAX_DURATION });
   console.log(`GIF Converter on http://localhost:${PORT}`);
   console.log(`Max upload: ${MAX_FILE_MB}MB | Max duration: ${MAX_DURATION}s`);
 });
