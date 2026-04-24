@@ -1,0 +1,14 @@
+FROM node:18-slim
+
+# Install ffmpeg
+RUN apt-get update && apt-get install -y ffmpeg --no-install-recommends \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+
+EXPOSE 8080
+USER node
+CMD ["node", "server.js"]
